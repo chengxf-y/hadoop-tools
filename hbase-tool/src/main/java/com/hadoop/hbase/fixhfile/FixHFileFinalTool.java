@@ -1,6 +1,5 @@
 package com.hadoop.hbase.fixhfile;
 
-
 import com.hadoop.hbase.config.ConfigHelper;
 import com.hadoop.hbase.fixmeta.ConfProperties;
 import org.apache.commons.cli.*;
@@ -9,39 +8,28 @@ import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.io.ByteBuffInputStream;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.io.hfile.*;
 import org.apache.hadoop.hbase.nio.ByteBuff;
+import org.apache.hadoop.hbase.nio.SingleByteBuff;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.io.compress.BlockDecompressorStream;
+import org.apache.hadoop.io.compress.CompressionCodec;
+import org.apache.hadoop.io.compress.Decompressor;
+import org.apache.log4j.Logger;
 
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
-import java.text.NumberFormat;
-import java.util.ArrayList;
 import java.util.Arrays;
 
-/**
- * @author jiazz
- * @version 1.0
- */
-public class FixHFileTool {
-    /**
-     * The size of a (key length, value length) tuple that prefixes each entry in
-     * a data block.
-     */
-    public final static int KEY_VALUE_LEN_SIZE = 2 * Bytes.SIZEOF_INT;
-    // Previous blocks that were used in the course of the read
-    private final ArrayList<HFileBlock> prevBlocks = new ArrayList<>();
-    private ByteBuff blockBuffer;
-    private   HFile.Reader reader;
-    private int currTagsLen;
-    private int currKeyLen;
-    private int currValueLen;
-    private long currMemstoreTS;
-    private int currMemstoreTSLen;
-    HFileBlock curBlock;
-
+public class FixHFileFinalTool {
+    private static Logger logger = Logger.getLogger(FixHFileFinalTool.class);
 
     private static final String HELP = "h";
     private static final String CONFIG_PATH = "c";
@@ -49,23 +37,10 @@ public class FixHFileTool {
     private static final String CORRUPTED_HFILE_PATH = "e";
     private static final String FIXED_HFILE_PATH = "f";
     private static final String BLOCK_COUNT_P = "b";
-    private static final String HEADER_SIZE_P = "d";
+    private static final String HEADER_SIZE_P = "i";
     private static final String MAX_DATA_SIZE_P = "d";
     private static final String COMPRESSION_ALGORITHM_P = "a";
-
-
-    /**
-     * If has checksum 33 else 24
-     */
-    private static int HEADER_SIZE;
-    /**
-     * How many data blocks does a hfile have
-     * blockOffsets arraySize
-     * e.g
-     * 77M  4000
-     * 223M 15000
-     */
-    private static int BLOCK_COUNT = 200000;
+    private static final String DISCARD_LAST_BLOCK_P = "l";
 
     /**
      * A hfile contains many data blocks,the default blockSize is 64k,
@@ -75,14 +50,44 @@ public class FixHFileTool {
      */
     private static  int MAX_DATA_SIZE = 32768;
 
-    private static Compression.Algorithm COMPRESSION_ALGORITHM;
+    /** If has checksum 33 else 24 **/
+    private static int HEADER_SIZE = 33;
+    private static int BLOCK_COUNT = 200000;
+    private static boolean DISCARD_LAST_BLOCK = false;
+
+    private static Compression.Algorithm COMPRESSION_ALGORITHM = Compression.Algorithm.SNAPPY;
+
+
+    private ByteBuff blockBuffer;
+    private HFileBlock curBlock;
+    private Path filePath;
+    /**corrupt hFile path*/
+    private int currTagsLen;
+    private int currKeyLen;
+    private int currValueLen;
+    private long currMemstoreTS;
+    private int currMemstoreTSLen;
+
+    /**Whether tags are to be included in the Read/Write**/
+    private boolean includesTags = false;
+    private boolean includesMemstoreTS = true;
+    protected boolean decodeMemstoreTS = true;
+
+    private static final int DATA_IBUF_SIZE = 1 * 1024;
+
+    /**
+     * The size of a (key length, value length) tuple that prefixes each entry in
+     * a data block.
+     */
+    public final static int KEY_VALUE_LEN_SIZE = 2 * Bytes.SIZEOF_INT;
+
 
     private static FileSystem fs;
     private static Configuration conf;
-    
+
+
     public static void main(String[] args) throws IOException, InterruptedException {
         cmdLineBegin(args);
-
     }
     private static void cmdLineBegin(String[] args) throws IOException, InterruptedException {
         Options options = new Options();
@@ -132,7 +137,7 @@ public class FixHFileTool {
                 .longOpt("headerSize")
                 .hasArg()
                 .argName("headerSize")
-                .desc("BlockHeader Size,if has checksum 33,else 24")
+                .desc("BlockHeader Size,if has checksum 33,else 24\n default:33")
                 .build());
 
         options.addOption(Option.builder(MAX_DATA_SIZE_P)
@@ -148,13 +153,18 @@ public class FixHFileTool {
                 .longOpt("compressionAlgorithm")
                 .hasArg()
                 .argName("compressionAlgorithm")
-                .desc("Compression Algorithm \nsupport values:none,snappy,lzo,gz,lz4,bzip2,zstd \n defalut: none")
+                .desc("Compression Algorithm \nsupport values:none,snappy,lzo,gz,lz4,bzip2,zstd \n default: none")
                 .build());
 
 
         options.addOption(Option.builder(KERBEROS_ENABLE)
                 .longOpt("kerberos")
                 .desc("If the cluster has Kerberos enabled,default is disable")
+                .build());
+
+        options.addOption(Option.builder(DISCARD_LAST_BLOCK_P)
+                .longOpt("discardLastBlock")
+                .desc("found if the trailer was damaged, the last block always cannot be decompressed\n default: false")
                 .build());
 
 
@@ -166,47 +176,26 @@ public class FixHFileTool {
             result = parser.parse(options, args);
         } catch (ParseException e) {
             System.err.println(e.getMessage());
-            formatter.printHelp("FixHFileTool", options, true);
+            formatter.printHelp("FixHFileFinalTool", options, true);
             System.exit(1);
         }
 
         if (result.hasOption(HELP)) {
-            formatter.printHelp("FixHFileTool", options, true);
+            formatter.printHelp("FixHFileFinalTool", options, true);
             System.exit(0);
         }
 
         if (result.hasOption(CORRUPTED_HFILE_PATH) && result.hasOption(FIXED_HFILE_PATH) && result.hasOption(CONFIG_PATH)) {
-            System.out.println("corruptHFilePath=" + result.getOptionValue(CORRUPTED_HFILE_PATH)
+            logger.info("corruptHFilePath=" + result.getOptionValue(CORRUPTED_HFILE_PATH)
                     + "\nfixedHFilePath=" + result.getOptionValue(FIXED_HFILE_PATH)
-                    + "\nconfigpath=" + result.getOptionValue(CONFIG_PATH));
+                    + "\nconfigPath=" + result.getOptionValue(CONFIG_PATH));
 
             HEADER_SIZE = Integer.parseInt(result.getOptionValue(HEADER_SIZE_P, "33"));
             BLOCK_COUNT = Integer.parseInt(result.getOptionValue(BLOCK_COUNT_P,"200000"));
             MAX_DATA_SIZE = Integer.parseInt(result.getOptionValue(MAX_DATA_SIZE_P,"32768"));
-
-            String compressAlg = result.getOptionValue(COMPRESSION_ALGORITHM_P,"none");
-            switch (compressAlg){
-                case "snappy":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.SNAPPY;
-                    break;
-                case "lzo":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.LZO;
-                    break;
-                case "bzip2":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.BZIP2;
-                    break;
-                case "lz4":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.LZ4;
-                    break;
-                case "gz":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.GZ;
-                    break;
-                case "zstd":
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.ZSTD;
-                    break;
-                default:
-                    COMPRESSION_ALGORITHM = Compression.Algorithm.NONE;
-
+            initCompressionAlgorithm(result.getOptionValue(COMPRESSION_ALGORITHM_P,"none"));
+            if(result.hasOption(DISCARD_LAST_BLOCK_P)){
+                DISCARD_LAST_BLOCK=true;
             }
 
             kerberosSwitch(result);
@@ -216,120 +205,173 @@ public class FixHFileTool {
         }
     }
 
+    private static void initCompressionAlgorithm(String compressAlg ){
+        switch (compressAlg){
+            case "snappy":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.SNAPPY;
+                break;
+            case "lzo":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.LZO;
+                break;
+            case "bzip2":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.BZIP2;
+                break;
+            case "lz4":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.LZ4;
+                break;
+            case "gz":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.GZ;
+                break;
+            case "zstd":
+                COMPRESSION_ALGORITHM = Compression.Algorithm.ZSTD;
+                break;
+            default:
+                COMPRESSION_ALGORITHM = Compression.Algorithm.NONE;
+
+        }
+    }
+
     private static void kerberosSwitch(CommandLine result) throws IOException, InterruptedException {
         ConfProperties.setPath(result.getOptionValue("c"));
         conf = ConfigHelper.getHadoopConf(result.hasOption(KERBEROS_ENABLE));
         fs = ConfigHelper.getFileSystem(conf,result.hasOption(KERBEROS_ENABLE));
         Path corruptPath = new Path(result.getOptionValue(CORRUPTED_HFILE_PATH));
         Path fixedPath = new Path(result.getOptionValue(FIXED_HFILE_PATH));
-        FixHFileTool fixHFileTool = new FixHFileTool();
-        fixHFileTool.kvReaderAndWriter(corruptPath,fixedPath);
+        FixHFileFinalTool fixHFileFinalTool = new FixHFileFinalTool();
+        fixHFileFinalTool.ioReaderAndWriter(corruptPath, fixedPath);
     }
 
-
-    /**
-     * Read the corruptHFile's normal data,And generate a newHFile
-     *
-     * @param corruptHFile HFile contains broken dataBlocks
-     * @param fixedFile Fixed HFile
-     * @throws IOException
-     */
-    public void kvReaderAndWriter (Path corruptHFile, Path fixedFile) throws IOException {
+    public void ioReaderAndWriter(Path corruptHFile, Path fixedFile) throws IOException {
         long beginTime = System.currentTimeMillis();
-        System.out.println("********************start fix hfile: "+ corruptHFile.toString()+"**************");
-        reader = HFile.createReader(fs, corruptHFile, CacheConfig.DISABLED, true,fs.getConf());
+        logger.info("********************start fix hfile: "+ corruptHFile.toString()+"**************");
         HFileContext hfileContext = new HFileContextBuilder().withCompression(COMPRESSION_ALGORITHM).build();
-
         HFile.Writer writer = HFile.getWriterFactory(conf,
                 new CacheConfig(conf)).withPath(fs, fixedFile).withFileContext(hfileContext).create();
-        long fileSize = fs.getFileStatus(corruptHFile).getLen();
+        FSDataInputStream inputStream = fs.open(corruptHFile);
+        filePath = corruptHFile;
 
+        logger.info("fileSize="+fs.getFileStatus(corruptHFile).getLen());
+        logger.info("**********getAllBlockOffsetAndDataSize**********");
+        int[] blockDataSizes = new int[BLOCK_COUNT];
+        long[] blockOffsets = new long[BLOCK_COUNT];
+        getAllBlockOffsetAndDataSize(corruptHFile,blockOffsets,blockDataSizes);
+        // blockOffsets[0] = 2073032;
+        // blockDataSizes[0] = 20822;
+        // blockOffsets[1] = 2093854;
+        // blockDataSizes[1] = 20881;
+
+
+        logger.info("**********readBlock,decompressBlock and writeBlock**********");
         try {
-            // FSDataInputStreamWrapper fsdis  = new FSDataInputStreamWrapper(fs, corruptHFile);
-            // FixedFileTrailer trailer =
-            //         FixedFileTrailer.readFromStream(fsdis.getStream(false), fileSize);
-            FixedFileTrailer trailer = reader.getTrailer();
-            long max = trailer.getLastDataBlockOffset();
-            // long offset = trailer.getFirstDataBlockOffset();
-            HFileBlock block;
-
-            int[] blockDataSizes = new int[BLOCK_COUNT];
-            long[] blookOffsets = new long[BLOCK_COUNT];
-            getAllBlockOffsetAndDataSize(corruptHFile,blookOffsets,blockDataSizes);
-            long offset;
             int index = 0;
-            int blockCount = 0;
-            int kvCount=0;
-
-            // read blocks
-            while (blookOffsets[index] <= max && blockDataSizes[index] !=0) {
-                offset = blookOffsets[index];
+            while (blockDataSizes[index] !=-1) {
+                /**found if the trailer is damaged, the last block always cannot be decompressed**/
+                if(DISCARD_LAST_BLOCK && blockDataSizes[index+1] == -1){
+                    index++;
+                    continue;
+                }
+                long offset = blockOffsets[index];
+                int onDiskSizeWithHeader = blockDataSizes[index];
+                int onDiskSizeWithoutHeader = onDiskSizeWithHeader - HEADER_SIZE;
                 index++;
-                /**
-                 * the broken blocks datasize always bigger than a nomal one,
-                 * discass
-                 */
                 if(blockDataSizes[index-1]> MAX_DATA_SIZE)
                     continue;
-    
-                block = reader.readBlock(offset, -1, /* cacheBlock */ false, /* pread */ false,
-                        /* isCompaction */ false, /* updateCacheMetrics */ false, null, null);
-                // offset += block.getOnDiskSizeWithHeader();
-                blockCount++;
-                blockBuffer =block.getBufferWithoutHeader();
-                updateCurrBlockRef(block);
-                // System.out.println("<<<<<<<<<<<<<<<<<<<<writing block ... ... ... ... ...\n"+block);
-                // read kv
+
+                byte[] headerBytes = new byte[HEADER_SIZE];
+                inputStream.readFully(offset,headerBytes,0,HEADER_SIZE);
+                byte[] onDiskBlockWithoutHeaderBytes = new byte[onDiskSizeWithoutHeader] ;
+                inputStream.readFully(offset+HEADER_SIZE,onDiskBlockWithoutHeaderBytes,0,onDiskSizeWithoutHeader);
+                byte [] onDiskBlock = new byte[onDiskSizeWithHeader];
+                System.arraycopy(headerBytes,0,onDiskBlock,0,HEADER_SIZE);
+                System.arraycopy(onDiskBlockWithoutHeaderBytes,0,onDiskBlock,HEADER_SIZE,onDiskSizeWithoutHeader);
+                ByteBuffer onDiskBlockByteBuffer = ByteBuffer.wrap(onDiskBlock, 0, onDiskSizeWithHeader);
+                HFileContextBuilder hFileContextBuilder = new HFileContextBuilder();
+                hFileContextBuilder.withCompression(COMPRESSION_ALGORITHM);
+                HFileContext fileContext = hFileContextBuilder.build();
+                HFileBlock blk =
+                        new HFileBlock(new SingleByteBuff(onDiskBlockByteBuffer), true,
+                                Cacheable.MemoryType.EXCLUSIVE, offset, 0, fileContext);
+                curBlock = blk;
+                if(!COMPRESSION_ALGORITHM.equals(Compression.Algorithm.NONE)){
+                    ByteBuff dup = blk.buf.duplicate();
+                    dup.position(blk.headerSize());
+                    dup = dup.slice();
+                    ByteBuffInputStream byteBuffInputStream = new ByteBuffInputStream(dup);
+                    InputStream dataInputStream = new DataInputStream(byteBuffInputStream);
+                    Decompressor decompressor = COMPRESSION_ALGORITHM.getDecompressor();
+                    CompressionCodec codec = COMPRESSION_ALGORITHM.getCodec();
+                    BlockDecompressorStream blockDecompressorStream = (BlockDecompressorStream) codec.createInputStream(dataInputStream, decompressor);
+                    InputStream inputStreamOfUncompress = new BufferedInputStream(blockDecompressorStream, DATA_IBUF_SIZE);
+                    try {
+                        int uncompressedSize = 0;
+                        inputStreamOfUncompress.mark(1);
+                        if(inputStreamOfUncompress.read()!=-1){
+                            uncompressedSize = blockDecompressorStream.originalBlockSize;
+                        }
+                        inputStreamOfUncompress.reset();
+                        allocateBuffer(blk,uncompressedSize);
+                        IOUtils.readFully(inputStreamOfUncompress, blk.getBufferWithoutHeader().array(), blk.getBufferWithoutHeader().arrayOffset(), uncompressedSize);
+                    } finally {
+                        inputStreamOfUncompress.close();
+                        blockDecompressorStream.close();
+                        byteBuffInputStream.close();
+                        dataInputStream.close();
+                    }
+                }else {
+                    allocateBuffer(blk,onDiskSizeWithoutHeader);
+                    System.arraycopy(onDiskBlockWithoutHeaderBytes,0,blk.getBufferWithoutHeader().array(),blk.getBufferWithoutHeader().arrayOffset(),onDiskSizeWithoutHeader);
+                }
+
+                blockBuffer =blk.getBufferWithoutHeader();
+
+                logger.debug("............writing block............\n"+blk);
                 do{
                     readKeyValueLen();
-                    if(this.currKeyLen == 0){
-                        System.out.println("skip 0 datasize, offset = " + block.getOffset());
-                        continue;
-                    }
-                    // System.out.println(block);
                     Cell cell = getCell();
-                    // System.out.println("write cell:\t" + cell);
                     writer.append(cell);
-                    kvCount++;
                     blockBuffer.skip(getCurCellSerializedSize());
                 }while (blockBuffer.remaining()>0);
             }
-            // System.out.println("trailer.getLastDataBlockOffset()="+trailer.getLastDataBlockOffset());
-            System.out.println("***********************finish fix hfile: "+ corruptHFile.toString()+"***********");
-            NumberFormat numberFormat = NumberFormat.getInstance();
-            numberFormat.setMaximumFractionDigits(2);
-            String lossRate = numberFormat.format(((float)trailer.getEntryCount()-(float)kvCount)/trailer.getEntryCount());
-            System.out.println("OldFile KV=" + trailer.getEntryCount()+"\tNewFile KV="+kvCount + "\t lossRate="+lossRate);
-            System.out.println("OldFile Size="+fileSize + "\tNewFile blockCount="+blockCount);
-            long endTime = System.currentTimeMillis();
-            System.out.println("totalUsedTime: "+(endTime-beginTime)/1000+"s");
+            logger.info("***********************finish fix hfile: "+ corruptHFile.toString()+"\t--->newFile="+fixedFile.toString()+"***********");
         } finally {
             writer.close();
-            reader.close();
             fs.close();
         }
+        long endTime = System.currentTimeMillis();
+        logger.info("=======totalUsedTime: "+(endTime-beginTime)/1000+"s======");
 
     }
 
     /**
-     * Compute blocks offset and dataSize(onDiskSizeWithHeader)
-     *
-     * if had blockType magicStr broken, the computed dataSize maybe two or more blocks sumSize
-     * @param file hFile path
-     * @param blockOffsets  blockOffset array
-     * @param blockDataSizes blockDataSize array
-     * @throws IOException
+     * Always allocates a new buffer of the correct size. Copies header bytes
+     * from the existing buffer. Does not change header fields.
+     * Reserve room to keep checksum bytes too.
      */
+    public void allocateBuffer(HFileBlock blk,int uncompressedSizeWithoutHeader) {
+        int cksumBytes = blk.totalChecksumBytes();
+        int headerSize = blk.headerSize();
+        int capacityNeeded = headerSize + uncompressedSizeWithoutHeader + cksumBytes;
+
+        // TODO we need consider allocating offheap here?
+        ByteBuffer newBuf = ByteBuffer.allocate(capacityNeeded);
+
+        // Copy header bytes into newBuf.
+        // newBuf is HBB so no issue in calling array()
+        blk.buf.position(0);
+        blk.buf.get(newBuf.array(), newBuf.arrayOffset(), headerSize);
+
+        blk.buf = new SingleByteBuff(newBuf);
+        // set limit to exclude next block's header
+        blk.buf.limit(headerSize + uncompressedSizeWithoutHeader + cksumBytes);
+    }
+
     public void getAllBlockOffsetAndDataSize(Path file, long[] blockOffsets, int[] blockDataSizes) throws IOException {
-        System.out.println("-------------start compute hFile block's offset and dataSize -----------------");
+        logger.info("-------------start compute hFile block's offset and dataSize -----------------");
         FSDataInputStream fsDataInputStream = fs.open(file);
-        long fileSize = fs.getFileStatus(file).getLen();
-        // System.out.println("fileSize="+fileSize);
         int count = 0;
         long offset = 0;
         long blockOffset = -1;
         byte[] oneByte = new byte[1];
-        // fsDataInputStream.seek(26684325);
 
         byte[] windowBytes = new byte[8];
         while (fsDataInputStream.read(oneByte)!=-1 ){
@@ -349,51 +391,42 @@ public class FixHFileTool {
                 if(count>0){
                     blockOffset = offset-8;
                     blockOffsets[count] = blockOffset;
-                    //currentBlockOffset - preBlockOffset = datasize
+                    //dataSize = currentBlockOffset - preBlockOffset
                     blockDataSizes[count-1] = (int)(blockOffset - blockOffsets[count-1]);
+                    logger.debug("found the " + (count-1) + "th block,\toffset="+blockOffsets[count-1]+"\tdataSize="+blockDataSizes[count-1]);
                 }else {
                     blockOffset = 0;
                     blockOffsets[count] = 0;
                 }
-                // System.out.println("found the " + count + "th block,\toffset="+blockOffset);
                 count++;
             }
         }
         int lastDataSize = BlockHeaderTools.getOnDiskSizeWithoutHeader(fsDataInputStream, blockOffset)+ HEADER_SIZE;
         blockDataSizes[count-1] = lastDataSize;
+        blockDataSizes[count] = -1;
+        logger.debug("found the " + (count-1) + "th block,\toffset="+blockOffsets[count-1]+"\tdataSize="+blockDataSizes[count-1]);
         fsDataInputStream.close();
-        System.out.println("-------------finish compute hFile block's offset and dataSize -----------------");
+        logger.info("-------------finish compute hFile block's offset and dataSize -----------------");
     }
-
-
 
     // Returns the #bytes in HFile for the current cell. Used to skip these many bytes in current
     // HFile block's buffer so as to position to the next cell.
     private int getCurCellSerializedSize() {
         int curCellSize =  KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen
                 + currMemstoreTSLen;
-        if (this.reader.getFileContext().isIncludesTags()) {
+        if (includesTags) {
             curCellSize += Bytes.SIZEOF_SHORT + currTagsLen;
         }
         return curCellSize;
     }
 
-
-    private int getKVBufSize() {
-        int kvBufSize = KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen;
-        if (currTagsLen > 0) {
-            kvBufSize += Bytes.SIZEOF_SHORT + currTagsLen;
-        }
-        return kvBufSize;
-    }
-
     public Cell getCell() {
 
-       int  currTagsLen = 0;
+        int  currTagsLen = 0;
         Cell ret;
         int cellBufSize = getKVBufSize();
         long seqId = 0L;
-        if (this.reader.shouldIncludeMemStoreTS()) {
+        if (includesMemstoreTS) {
             seqId = currMemstoreTS;
         }
         if (blockBuffer.hasArray()) {
@@ -424,20 +457,13 @@ public class FixHFileTool {
         return ret;
     }
 
-
-
-    void updateCurrBlockRef(HFileBlock block) {
-        if (block != null && this.curBlock != null &&
-                block.getOffset() == this.curBlock.getOffset()) {
-            return;
+    private int getKVBufSize() {
+        int kvBufSize = KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen;
+        if (currTagsLen > 0) {
+            kvBufSize += Bytes.SIZEOF_SHORT + currTagsLen;
         }
-        // We don't have to keep ref to EXCLUSIVE type of block
-        if (this.curBlock != null && this.curBlock.usesSharedMemory()) {
-            prevBlocks.add(this.curBlock);
-        }
-        this.curBlock = block;
+        return kvBufSize;
     }
-
     protected void readKeyValueLen() {
         // This is a hot method. We go out of our way to make this method short so it can be
         // inlined and is not too big to compile. We also manage position in ByteBuffer ourselves
@@ -455,7 +481,7 @@ public class FixHFileTool {
         checkKeyValueLen();
         // Move position past the key and value lengths and then beyond the key and value
         int p = (Bytes.SIZEOF_LONG + currKeyLen + currValueLen);
-        if (reader.getFileContext().isIncludesTags()) {
+        if (includesTags) {
             // Tags length is a short.
             this.currTagsLen = blockBuffer.getShortAfterPosition(p);
             checkTagsLen();
@@ -470,8 +496,8 @@ public class FixHFileTool {
      */
     protected void readMvccVersion(final int offsetFromPos) {
         // See if we even need to decode mvcc.
-        if (!this.reader.shouldIncludeMemStoreTS()) return;
-        if (!this.reader.isDecodeMemStoreTS()) {
+        if (!includesMemstoreTS) return;
+        if (!decodeMemstoreTS) {
             currMemstoreTS = 0;
             currMemstoreTSLen = 1;
             return;
@@ -518,14 +544,13 @@ public class FixHFileTool {
         this.currMemstoreTSLen = len;
     }
 
-
     private final void checkTagsLen() {
         if (checkLen(this.currTagsLen)) {
             throw new IllegalStateException("Invalid currTagsLen " + this.currTagsLen +
                     ". Block offset: " + curBlock.getOffset() + ", block length: " +
                     this.blockBuffer.limit() +
                     ", position: " + this.blockBuffer.position() + " (without header)." +
-                    " path=" + reader.getPath());
+                    " path=" + filePath);
         }
     }
 
@@ -546,7 +571,7 @@ public class FixHFileTool {
                     + " or currValueLen " + this.currValueLen + ". Block offset: "
                     + this.curBlock.getOffset() + ", block length: "
                     + this.blockBuffer.limit() + ", position: " + this.blockBuffer.position()
-                    + " (without header)." + ", path=" + reader.getPath());
+                    + " (without header)." + ", path=" + filePath);
         }
     }
 
